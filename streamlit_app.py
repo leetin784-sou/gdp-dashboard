@@ -1,22 +1,39 @@
-# streamlit_app.py
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Optional: load trained model if you provide one (joblib)
+try:
+    import joblib
+except Exception:
+    joblib = None
+
 # =========================
-# App metadata
+# Metadata
 # =========================
 APP_NAME = "TriageAI"
-APP_VERSION = "1.0.0-safety"
-MODEL_VERSION = "ensemble-logit-v1"
-st.set_page_config(page_title=f"{APP_NAME} ({APP_VERSION})", layout="wide")
+APP_VERSION = "3.6-hoathanhque"
+MODEL_VERSION = "ensemble-v1 (demo weights) + optional trained model"
+REPO_HINT = "Deploy from GitHub on Streamlit Cloud"
+
+# =========================
+# Safety & thresholds
+# =========================
+RISK_RED = 0.70
+RISK_YELLOW = 0.30
+
+UNC_MED = 0.10
+UNC_HIGH = 0.20
+
+MODEL_PATH = Path("models/trained_model.joblib")  # optional
 
 # =========================
 # Data model
@@ -33,21 +50,9 @@ class Patient:
     chest_pain: bool
     trauma: bool
     severe_dyspnea: bool
-    altered_mental: bool  # quick checkbox if not using AVPU deeply
-
-@dataclass
-class EvalResult:
-    timestamp: str
-    risk: float
-    uncertainty: float
-    uncertainty_level: str
-    suggestion: str
-    safety_note: str
-    red_flags: str
-    reasons: str
 
 # =========================
-# Utility
+# Utils
 # =========================
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -56,52 +61,51 @@ def sigmoid(z: float) -> float:
     z = clamp(z, -40, 40)
     return 1.0 / (1.0 + math.exp(-z))
 
-def avpu_to_idx(avpu: str) -> int:
+def avpu_idx(avpu: str) -> int:
     return {"A": 0, "V": 1, "P": 2, "U": 3}.get(avpu, 0)
 
 # =========================
-# 1) Input validation (reliability layer)
+# 1) Input validation
 # =========================
 def validate_inputs(p: Patient) -> Tuple[bool, List[str]]:
-    issues = []
+    hard = []
+    soft = []
 
-    # hard plausible ranges
-    if not (0 <= p.age <= 120): issues.append("Tuổi ngoài phạm vi 0–120.")
-    if not (30 <= p.hr <= 220): issues.append("HR ngoài phạm vi 30–220 bpm.")
-    if not (50 <= p.sbp <= 250): issues.append("SBP ngoài phạm vi 50–250 mmHg.")
-    if not (50 <= p.spo2 <= 100): issues.append("SpO₂ ngoài phạm vi 50–100%.")
-    if not (5 <= p.rr <= 60): issues.append("RR ngoài phạm vi 5–60 /phút.")
-    if not (34.0 <= p.temp_c <= 42.0): issues.append("Nhiệt độ ngoài phạm vi 34–42°C.")
-    if p.avpu not in {"A", "V", "P", "U"}: issues.append("AVPU không hợp lệ.")
+    if not (0 <= p.age <= 120): hard.append("Age must be 0–120.")
+    if not (30 <= p.hr <= 220): hard.append("HR must be 30–220 bpm.")
+    if not (50 <= p.sbp <= 250): hard.append("SBP must be 50–250 mmHg.")
+    if not (50 <= p.spo2 <= 100): hard.append("SpO₂ must be 50–100%.")
+    if not (5 <= p.rr <= 60): hard.append("RR must be 5–60 /min.")
+    if not (34.0 <= p.temp_c <= 42.0): hard.append("Temp must be 34–42°C.")
+    if p.avpu not in {"A", "V", "P", "U"}: hard.append("AVPU must be A/V/P/U.")
 
-    # soft consistency checks (không khóa, chỉ cảnh báo)
-    if p.spo2 < 85 and not p.severe_dyspnea:
-        issues.append("SpO₂ rất thấp nhưng chưa tick 'khó thở nặng' (kiểm tra lại).")
+    # soft consistency checks
+    if p.spo2 < 88 and not p.severe_dyspnea:
+        soft.append("SpO₂ very low but severe dyspnea not checked (re-check).")
+    if p.sbp < 90 and p.hr < 60:
+        soft.append("Low SBP with low HR can be unusual—verify measurements.")
 
-    ok = len([x for x in issues if "ngoài phạm vi" in x or "không hợp lệ" in x]) == 0
+    ok = len(hard) == 0
+    issues = hard + soft
     return ok, issues
 
 # =========================
-# 2) Safety rules (hard layer)
+# 2) Hard safety rules (Red flags)
 # =========================
 def red_flags(p: Patient) -> List[str]:
     flags = []
     if p.spo2 < 90: flags.append("SpO₂ < 90%")
     if p.sbp < 90: flags.append("SBP < 90 mmHg")
-    if avpu_to_idx(p.avpu) >= 2: flags.append("AVPU = P/U")
-    if p.altered_mental: flags.append("Rối loạn tri giác (checkbox)")
-    if p.severe_dyspnea: flags.append("Khó thở nặng")
+    if avpu_idx(p.avpu) >= 2: flags.append("AVPU = P/U (reduced consciousness)")
+    if p.severe_dyspnea: flags.append("Severe dyspnea")
     if p.hr >= 140: flags.append("HR ≥ 140")
     if p.rr >= 30: flags.append("RR ≥ 30")
     return flags
 
 # =========================
-# 3) Risk model (ensemble) + uncertainty
-#    - “Tin cậy” hơn demo 1 model: nhiều model (ensemble)
-#    - u = std(p_i) giữa các model
+# 3) Feature engineering (interpretable)
 # =========================
-def _features(p: Patient) -> Dict[str, float]:
-    # features (giải thích được)
+def features(p: Patient) -> Dict[str, float]:
     return {
         "age": float(p.age),
         "hr_excess": float(max(0, p.hr - 90)),
@@ -109,52 +113,74 @@ def _features(p: Patient) -> Dict[str, float]:
         "spo2_drop": float(max(0, 95 - p.spo2)),
         "rr_excess": float(max(0, p.rr - 18)),
         "temp_excess": float(max(0, p.temp_c - 37.5)),
-        "avpu": float(avpu_to_idx(p.avpu)),
+        "avpu": float(avpu_idx(p.avpu)),
         "chest_pain": float(1 if p.chest_pain else 0),
         "trauma": float(1 if p.trauma else 0),
         "severe_dyspnea": float(1 if p.severe_dyspnea else 0),
-        "altered_mental": float(1 if p.altered_mental else 0),
     }
 
-def _ensemble_params(seed: int = 42) -> List[Dict[str, float]]:
-    """
-    Tạo 1 ensemble logistic n_models bộ beta hơi khác nhau.
-    (Trong bài thật: bạn thay bằng model train từ data.)
-    """
+FEATURE_LABELS = {
+    "spo2_drop": "Low SpO₂",
+    "sbp_drop": "Low SBP",
+    "hr_excess": "High HR",
+    "rr_excess": "High RR",
+    "avpu": "Reduced consciousness",
+    "temp_excess": "Fever",
+    "chest_pain": "Chest pain",
+    "trauma": "Trauma",
+    "severe_dyspnea": "Severe dyspnea",
+    "age": "Age",
+}
+
+# =========================
+# 4) AI layer (two modes)
+#    A) Optional trained model (if provided)
+#    B) Otherwise: ensemble logistic (demo) with uncertainty = std
+# =========================
+@st.cache_resource(show_spinner=False)
+def load_trained_model() -> Optional[object]:
+    if joblib is None:
+        return None
+    if MODEL_PATH.exists():
+        try:
+            return joblib.load(MODEL_PATH)
+        except Exception:
+            return None
+    return None
+
+def ensemble_params(seed: int = 42, n_models: int = 21) -> List[Dict[str, float]]:
     rng = np.random.default_rng(seed)
     base = {
-        "b0": -7.2,
+        "b0": -7.0,
         "age": 0.012,
         "hr_excess": 0.020,
         "sbp_drop": 0.050,
-        "spo2_drop": 0.110,
+        "spo2_drop": 0.115,
         "rr_excess": 0.028,
         "temp_excess": 0.45,
         "avpu": 0.95,
-        "chest_pain": 0.25,
+        "chest_pain": 0.22,
         "trauma": 0.35,
         "severe_dyspnea": 0.55,
-        "altered_mental": 0.60,
     }
 
     models = []
-    for _ in range(15):
+    for _ in range(n_models):
         m = {"b0": base["b0"] + rng.normal(0, 0.25)}
         for k in base:
-            if k == "b0": 
+            if k == "b0":
                 continue
-            # jitter nhỏ giúp thể hiện uncertainty theo model disagreement
-            m[k] = base[k] * (1.0 + rng.normal(0, 0.08))
+            m[k] = base[k] * (1.0 + rng.normal(0, 0.10))
         models.append(m)
     return models
 
 @st.cache_data(show_spinner=False)
-def get_models() -> List[Dict[str, float]]:
-    return _ensemble_params(seed=42)
+def get_ensemble() -> List[Dict[str, float]]:
+    return ensemble_params(seed=42, n_models=21)
 
-def predict_risk_and_uncertainty(p: Patient) -> Tuple[float, float, List[float], Dict[str, float]]:
-    x = _features(p)
-    models = get_models()
+def predict_with_ensemble(p: Patient) -> Tuple[float, float, Dict[str, float], List[float]]:
+    x = features(p)
+    models = get_ensemble()
 
     ps = []
     for m in models:
@@ -163,122 +189,161 @@ def predict_risk_and_uncertainty(p: Patient) -> Tuple[float, float, List[float],
             z += m.get(k, 0.0) * v
         ps.append(sigmoid(z))
 
-    ps_arr = np.array(ps, dtype=float)
-    mean_p = float(ps_arr.mean())
-    std_p = float(ps_arr.std(ddof=1))
+    arr = np.array(ps, dtype=float)
+    mean_p = float(arr.mean())
+    std_p = float(arr.std(ddof=1))
 
-    # “explanation”: contribution theo base weights (không phải SHAP nhưng giải thích được)
+    # explanation: contribution using first model weights
     base = models[0]
-    contrib = {k: base.get(k, 0.0) * v for k, v in x.items()}
-    # sort by absolute impact
-    contrib_sorted = dict(sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True))
-    return mean_p, std_p, ps, contrib_sorted
+    contrib = {k: float(base.get(k, 0.0) * v) for k, v in x.items()}
+    contrib = dict(sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True))
+    return mean_p, std_p, contrib, ps
+
+def predict_with_trained_model(p: Patient, model) -> Tuple[float, float, Dict[str, float], List[float]]:
+    """
+    If you train a model, replace this with your real pipeline.
+    For now:
+    - If model supports predict_proba: use it.
+    - Uncertainty fallback: 0.0 (unless you implement ensemble for trained model).
+    """
+    x = features(p)
+    X = pd.DataFrame([x])
+
+    if hasattr(model, "predict_proba"):
+        proba = float(model.predict_proba(X)[0][1])
+    else:
+        proba = float(model.predict(X)[0])
+
+    contrib = {k: 0.0 for k in x.keys()}  # placeholder for real explainers
+    return proba, 0.0, contrib, [proba]
+
+# =========================
+# 5) Conformal (optional, lightweight)
+#    If uncertainty is high or risk in gray zone, output a SET of labels.
+# =========================
+def conformal_label_set(risk: float, u: float) -> List[str]:
+    """
+    Simple conformal-style behavior (demo):
+    - High uncertainty => return multiple possible labels
+    - Otherwise => single label
+    """
+    if u >= UNC_HIGH:
+        # very uncertain -> wide set
+        return ["🟢 GREEN", "🟡 YELLOW", "🔴 RED"]
+    if u >= UNC_MED:
+        # medium uncertain -> likely 2 labels
+        if risk >= RISK_RED:
+            return ["🟡 YELLOW", "🔴 RED"]
+        if risk >= RISK_YELLOW:
+            return ["🟢 GREEN", "🟡 YELLOW"]
+        return ["🟢 GREEN", "🟡 YELLOW"]
+    return [triage_label(risk)]
+
+# =========================
+# 6) Decision policy (Human-in-the-loop)
+# =========================
+def triage_label(risk: float) -> str:
+    if risk >= RISK_RED:
+        return "🔴 RED"
+    if risk >= RISK_YELLOW:
+        return "🟡 YELLOW"
+    return "🟢 GREEN"
 
 def uncertainty_level(u: float) -> str:
-    if u >= 0.20: return "CAO"
-    if u >= 0.10: return "TRUNG BÌNH"
-    return "THẤP"
+    if u >= UNC_HIGH:
+        return "HIGH"
+    if u >= UNC_MED:
+        return "MEDIUM"
+    return "LOW"
 
-# =========================
-# 4) Decision policy (Human-in-the-loop gate)
-# =========================
-def triage_from_risk(r: float) -> str:
-    if r >= 0.70: return "🔴 ĐỎ"
-    if r >= 0.30: return "🟡 VÀNG"
-    return "🟢 XANH"
-
-def decision(p: Patient, mean_risk: float, u: float, flags: List[str]) -> Tuple[str, str]:
-    """
-    Safety-first:
-    - Red flags => ĐỎ ngay
-    - Nếu không red flags:
-        + risk cao nhưng u cao => yêu cầu bác sĩ đánh giá kỹ
-        + u thấp => có thể khuyến nghị mạnh hơn
-    """
+def decision_policy(flags: List[str], risk: float, u: float) -> Tuple[str, str]:
+    # Hard safety
     if flags:
-        return "🔴 ĐỎ (Red flags)", "Luật an toàn kích hoạt: " + "; ".join(flags)
+        return "🔴 RED (Hard safety)", "Red flags triggered: " + "; ".join(flags)
 
-    base = triage_from_risk(mean_risk)
+    # Soft safety / HITL
     ul = uncertainty_level(u)
+    base = triage_label(risk)
 
-    if ul == "CAO":
-        note = "⚠️ Uncertainty CAO → không đưa khuyến nghị mạnh; cần bác sĩ đánh giá kỹ."
-    elif ul == "TRUNG BÌNH":
-        note = "Uncertainty TRUNG BÌNH → khuyến nghị kiểm tra thêm (đo lại vitals/khai thác)."
-    else:
-        note = "Uncertainty THẤP → mô hình khá tự tin."
+    if ul == "HIGH":
+        return base + " (Review required)", "High uncertainty: do NOT auto-triage. Clinician review required."
+    if ul == "MEDIUM":
+        return base + " (Confirm)", "Medium uncertainty: re-check vitals / ask key questions before finalizing."
+    return base, "Low uncertainty: model agreement is high (still clinician decides)."
 
-    # Nếu risk rất cao mà u thấp → cảnh báo mạnh
-    if mean_risk >= 0.80 and ul == "THẤP":
-        note = "⚠️ Cảnh báo mạnh: Risk rất cao & Uncertainty thấp → ưu tiên xử trí ngay."
-    return base, note
-
-def format_reasons(contrib_sorted: Dict[str, float], topk: int = 5) -> str:
-    # map keys to human text
-    name = {
-        "spo2_drop": "SpO₂ thấp",
-        "sbp_drop": "Huyết áp thấp",
-        "hr_excess": "Mạch nhanh",
-        "rr_excess": "Thở nhanh",
-        "avpu": "Tri giác giảm",
-        "temp_excess": "Sốt",
-        "chest_pain": "Đau ngực",
-        "trauma": "Chấn thương",
-        "severe_dyspnea": "Khó thở nặng",
-        "altered_mental": "Rối loạn tri giác",
-        "age": "Tuổi",
-    }
-    items = []
-    for k, v in list(contrib_sorted.items())[:topk]:
-        if abs(v) < 0.05:
+def top_reasons(contrib: Dict[str, float], k: int = 5) -> str:
+    picks = []
+    for feat, val in list(contrib.items())[:k]:
+        if abs(val) < 0.05:
             continue
-        items.append(name.get(k, k))
-    return "; ".join(items) if items else "Không có yếu tố nổi bật"
+        picks.append(FEATURE_LABELS.get(feat, feat))
+    return "; ".join(picks) if picks else "No dominant factors."
+
+# =========================
+# 7) Logging / Audit
+# =========================
+def append_log(p: Patient, risk: float, u: float, suggestion: str, note: str, flags: List[str], reasons: str, label_set: List[str]):
+    st.session_state.setdefault("logs", [])
+    st.session_state["logs"].append({
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        **asdict(p),
+        "risk": risk,
+        "uncertainty": u,
+        "uncertainty_level": uncertainty_level(u),
+        "suggestion": suggestion,
+        "note": note,
+        "red_flags": "; ".join(flags),
+        "reasons": reasons,
+        "label_set": " | ".join(label_set),
+        "app_version": APP_VERSION,
+        "model_version": MODEL_VERSION,
+    })
 
 # =========================
 # UI
 # =========================
-st.title(f"{APP_NAME} – Risk + Uncertainty")
-st.caption("Bản Safety‑first: Rule‑based (red flags) + Risk score + Uncertainty + Human‑in‑the‑loop + Logging.")
+st.title(f"{APP_NAME} – High‑Reliability Triage Support")
+st.caption("Safety-first: Red flags → always override. Risk + Uncertainty + (optional) Conformal label set + Audit logs.")
+
 with st.sidebar:
-    st.subheader("Thông tin hệ thống")
-    st.write(f"- App version: **{APP_VERSION}**")
-    st.write(f"- Model version: **{MODEL_VERSION}**")
+    st.subheader("System Info")
+    st.write(f"**App:** {APP_VERSION}")
+    st.write(f"**Model:** {MODEL_VERSION}")
+    st.write(f"**Deploy:** {REPO_HINT}")
     st.markdown("---")
-    st.caption("⚠️ Demo phục vụ học thuật/thuyết trình. Không dùng cho quyết định lâm sàng thật.")
+    use_conformal = st.toggle("Use conformal label set (recommended for safety demos)", value=True)
+    st.caption("⚠️ Research/demo only. Not for clinical decisions without validation.")
 
-tabs = st.tabs(["🧾 Đánh giá", "📊 Method & Safety", "📤 Logs/Export"])
+tab_eval, tab_method, tab_logs = st.tabs(["🧾 Evaluate", "📘 Method & Safety", "📤 Logs / Export"])
 
-# ---------- Tab 1: Evaluate ----------
-with tabs[0]:
-    col1, col2, col3 = st.columns([1, 1, 1])
+# ---- Evaluate
+with tab_eval:
+    c1, c2, c3 = st.columns(3)
 
-    with col1:
+    with c1:
         st.subheader("Vitals")
-        age = st.number_input("Tuổi", 0, 120, 40)
-        hr = st.number_input("Mạch (HR, bpm)", 30, 220, 90)
-        sbp = st.number_input("Huyết áp tâm thu (SBP, mmHg)", 50, 250, 120)
+        age = st.number_input("Age", 0, 120, 40)
+        hr = st.number_input("HR (bpm)", 30, 220, 90)
+        sbp = st.number_input("SBP (mmHg)", 50, 250, 120)
         spo2 = st.number_input("SpO₂ (%)", 50, 100, 98)
-        rr = st.number_input("Nhịp thở (RR, /phút)", 5, 60, 18)
-        temp_c = st.number_input("Nhiệt độ (°C)", 34.0, 42.0, 37.0, 0.1)
+        rr = st.number_input("RR (/min)", 5, 60, 18)
+        temp_c = st.number_input("Temp (°C)", 34.0, 42.0, 37.0, 0.1)
 
-    with col2:
-        st.subheader("Tình trạng")
-        avpu = st.selectbox("AVPU", ["A", "V", "P", "U"], index=0, help="A: tỉnh; V: đáp ứng lời; P: đáp ứng đau; U: không đáp ứng")
-        altered_mental = st.checkbox("Rối loạn tri giác (nếu có)")
-        severe_dyspnea = st.checkbox("Khó thở nặng")
+    with c2:
+        st.subheader("Status")
+        avpu = st.selectbox("AVPU", ["A", "V", "P", "U"], index=0, help="A: alert, V: voice, P: pain, U: unresponsive")
+        severe_dyspnea = st.checkbox("Severe dyspnea")
+        chest_pain = st.checkbox("Chest pain")
 
-    with col3:
-        st.subheader("Bối cảnh")
-        chest_pain = st.checkbox("Đau ngực")
-        trauma = st.checkbox("Chấn thương")
+    with c3:
+        st.subheader("Context")
+        trauma = st.checkbox("Trauma")
+        st.markdown("### Thresholds")
+        st.write(f"- RED if risk ≥ {int(RISK_RED*100)}%")
+        st.write(f"- YELLOW if {int(RISK_YELLOW*100)}–{int(RISK_RED*100)-1}%")
+        st.write(f"- GREEN if < {int(RISK_YELLOW*100)}%")
 
-        st.markdown("### Ngưỡng gợi ý (demo)")
-        st.write("- Risk ≥ 0.70 → Đỏ")
-        st.write("- 0.30–0.69 → Vàng")
-        st.write("- < 0.30 → Xanh")
-
-    p = Patient(
+    patient = Patient(
         age=int(age),
         hr=int(hr),
         sbp=int(sbp),
@@ -289,110 +354,96 @@ with tabs[0]:
         chest_pain=bool(chest_pain),
         trauma=bool(trauma),
         severe_dyspnea=bool(severe_dyspnea),
-        altered_mental=bool(altered_mental),
     )
 
-    ok, issues = validate_inputs(p)
+    ok, issues = validate_inputs(patient)
     if issues:
-        st.warning("**Kiểm tra dữ liệu:**\n- " + "\n- ".join(issues))
+        st.warning("Input checks:\n- " + "\n- ".join(issues))
 
-    # button disabled if hard-invalid
-    run = st.button("Đánh giá Risk + Uncertainty", type="primary", use_container_width=True, disabled=not ok)
+    flags = red_flags(patient)
+    if flags:
+        st.error("Hard safety red flags detected:\n- " + "\n- ".join(flags))
+
+    run = st.button("Run assessment", type="primary", use_container_width=True, disabled=not ok)
 
     if run:
-        try:
-            flags = red_flags(p)
-            mean_risk, u, ps, contrib_sorted = predict_risk_and_uncertainty(p)
-            suggestion, safety_note = decision(p, mean_risk, u, flags)
-            reasons = format_reasons(contrib_sorted)
+        trained = load_trained_model()
 
-            a, b, c = st.columns(3)
-            a.metric("Risk score (P nguy kịch)", f"{mean_risk*100:.1f}%")
-            b.metric("Uncertainty (σ)", f"{u:.3f}")
-            c.metric("Mức tin cậy", uncertainty_level(u))
+        try:
+            if trained is not None:
+                risk, u, contrib, ps = predict_with_trained_model(patient, trained)
+            else:
+                risk, u, contrib, ps = predict_with_ensemble(patient)
+
+            suggestion, note = decision_policy(flags, risk, u)
+            reasons = top_reasons(contrib)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Risk (P critical)", f"{risk*100:.1f}%")
+            m2.metric("Uncertainty (σ)", f"{u:.3f}")
+            m3.metric("Uncertainty level", uncertainty_level(u))
 
             if "🔴" in suggestion:
-                st.error(f"**Gợi ý phân luồng:** {suggestion}\n\n{safety_note}")
+                st.error(f"**Suggestion:** {suggestion}\n\n{note}")
             elif "🟡" in suggestion:
-                st.warning(f"**Gợi ý phân luồng:** {suggestion}\n\n{safety_note}")
+                st.warning(f"**Suggestion:** {suggestion}\n\n{note}")
             else:
-                st.success(f"**Gợi ý phân luồng:** {suggestion}\n\n{safety_note}")
+                st.success(f"**Suggestion:** {suggestion}\n\n{note}")
 
-            st.markdown("### Giải thích (để thuyết trình)")
-            st.write(f"**Lý do nổi bật:** {reasons}")
-            with st.expander("Xem đóng góp đặc trưng (debug/giải thích sâu)"):
-                dfc = pd.DataFrame(
-                    [{"feature": k, "contribution": float(v)} for k, v in list(contrib_sorted.items())[:10]]
-                )
-                st.dataframe(dfc, use_container_width=True)
+            st.markdown("### Explanation (for judges)")
+            st.write(f"**Top reasons:** {reasons}")
 
-            # Save log
-            ts = datetime.now().isoformat(timespec="seconds")
-            res = EvalResult(
-                timestamp=ts,
-                risk=mean_risk,
-                uncertainty=u,
-                uncertainty_level=uncertainty_level(u),
-                suggestion=suggestion,
-                safety_note=safety_note,
-                red_flags="; ".join(flags) if flags else "",
-                reasons=reasons,
-            )
-            log_row = {**asdict(p), **asdict(res)}
-            st.session_state.setdefault("logs", [])
-            st.session_state["logs"].append(log_row)
+            with st.expander("Debug: model disagreement distribution"):
+                st.write(pd.DataFrame({"p_i": ps}).describe())
+
+            label_set = conformal_label_set(risk, u) if use_conformal else [triage_label(risk)]
+            st.markdown("### Safety output")
+            st.write("**Label set (when uncertain):** " + " / ".join(label_set))
+
+            append_log(patient, risk, u, suggestion, note, flags, reasons, label_set)
 
         except Exception as e:
-            # fail-safe fallback
-            st.error("Có lỗi khi tính AI. Hệ thống chuyển sang chế độ an toàn (rule-based).")
-            flags = red_flags(p)
+            st.error("Model error → Fail-safe activated (rule-based only).")
             if flags:
-                st.error("🔴 ĐỎ (Red flags) – " + "; ".join(flags))
+                st.error("🔴 RED (Hard safety): " + "; ".join(flags))
             else:
-                st.warning("🟡 VÀNG (Fallback) – Khuyến nghị bác sĩ đánh giá lâm sàng.")
-            st.caption(f"Debug (không cần đưa vào báo cáo): {e!r}")
+                st.warning("🟡 YELLOW (Fail-safe): clinician review.")
+            st.caption(f"Debug: {e!r}")
 
-# ---------- Tab 2: Method & Safety ----------
-with tabs[1]:
-    st.subheader("Method & Safety (để BGK đọc)")
+# ---- Method & Safety
+with tab_method:
+    st.subheader("Method & Safety")
     st.markdown(
         """
-**Kiến trúc tin cậy cao (Safety-first):**
-1) **Input validation**: dữ liệu ngoài phạm vi hợp lý → không cho đánh giá (giảm “rác vào”).  
-2) **Hard rules / Red flags**: kích hoạt ưu tiên **ĐỎ** ngay (an toàn là trên hết).  
-3) **Risk score**: ước lượng xác suất nguy kịch **liên tục** (0–100%).  
-4) **Uncertainty**: tính từ **ensemble** (mức bất đồng giữa nhiều mô hình) → biết khi nào “không chắc”.  
-5) **Human-in-the-loop**: Uncertainty cao → **không áp đặt**, yêu cầu bác sĩ đánh giá kỹ.  
-6) **Logging/Audit**: lưu input–output để truy vết, xuất CSV.
+**High-reliability design (Safety-first)**  
+1) **Input validation** prevents garbage-in.  
+2) **Hard red flags** override all AI output.  
+3) AI provides **Risk** (probability) + **Uncertainty** (model disagreement).  
+4) **Human-in-the-loop policy**: uncertainty high → “review required”.  
+5) **Conformal label set (optional)**: when uncertain, output multiple acceptable labels instead of a single risky claim.  
+6) **Audit logs** store inputs/outputs with versioning.
 
-**Vì sao không nói “đúng 99%”?**  
-Đề tài y tế ưu tiên **an toàn**: đo **Recall lớp nguy kịch** và **tỷ lệ bỏ sót nguy kịch**, hơn là accuracy chung.
+**Why this is safer than “just accuracy”:**  
+In triage, we optimize **miss rate of critical cases** and make the system **honest about uncertainty**.
         """
     )
-    st.markdown("### Quy tắc quyết định (tóm tắt)")
-    st.code(
-        "Nếu red flags → ĐỎ ngay\n"
-        "Nếu không: dùng Risk + Uncertainty\n"
-        "- Risk cao & Uncertainty thấp → cảnh báo mạnh\n"
-        "- Uncertainty cao → yêu cầu bác sĩ đánh giá",
-        language="text",
-    )
+    st.markdown("### What to say to judges (1 sentence)")
+    st.info("We prioritize safety: red flags override AI, and uncertainty triggers clinician review instead of confident guesses.")
 
-# ---------- Tab 3: Logs / Export ----------
-with tabs[2]:
-    st.subheader("Logs / Export (Audit trail)")
+# ---- Logs / Export
+with tab_logs:
+    st.subheader("Audit logs")
     logs = st.session_state.get("logs", [])
     if not logs:
-        st.info("Chưa có log. Hãy chạy vài ca ở tab **Đánh giá**.")
+        st.info("No logs yet. Run a few cases in Evaluate.")
     else:
         df = pd.DataFrame(logs)
-        st.dataframe(df, use_container_width=True, height=350)
+        st.dataframe(df, use_container_width=True, height=360)
 
-        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Tải logs CSV",
-            data=csv,
-            file_name="triageai_logs.csv",
+            "Download CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="triageai_audit_logs.csv",
             mime="text/csv",
             use_container_width=True,
         )
