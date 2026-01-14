@@ -9,25 +9,45 @@ from datetime import datetime
 # CONFIG & STYLE
 # =========================
 st.set_page_config(page_title="Smart Triage AI Pro", layout="wide", page_icon="🚑")
+
 st.markdown("""
 <style>
-.main { background-color: #f8f9fa; }
+.main { background-color: #0b1220; }
 .block-container { padding-top: 1.2rem; }
-.stMetric { background-color: #ffffff; padding: 14px; border-radius: 10px;
-           box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+
+/* Fix metric visibility on dark background */
+[data-testid="stMetric"] {
+    background-color: #111827 !important;
+    color: #F9FAFB !important;
+    border-radius: 12px;
+    padding: 16px;
+    border: 1px solid #1F2937;
+}
+[data-testid="stMetricLabel"] {
+    color: #9CA3AF !important;
+    font-size: 0.9rem;
+}
+[data-testid="stMetricValue"] {
+    color: #F9FAFB !important;
+    font-size: 1.6rem;
+    font-weight: 700;
+}
+
+/* Header */
 .triage-header { text-align: center; padding: 18px; border-radius: 12px; color: white; margin: 8px 0 18px 0; }
-.small-note { color: #6c757d; font-size: 0.9rem; }
+.small-note { color: #9CA3AF; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "v5.0 – Combined (EWS+GCS+SI + Risk/Uncertainty + Dept + Explain + Audit)"
-MODEL_NOTE = "Safety-first: Red flags > EWS > AI Risk+Uncertainty (Human-in-the-loop)."
+APP_VERSION = "v6.0 – High-Trust (EWS+GCS+SI + AI Risk/Unc + Context + Dept + Protocol + Audit)"
+MODEL_NOTE = "Safety-first: Red flags > Clinical scores > AI Risk+Uncertainty (Human-in-the-loop)."
 
 # =========================
 # DATA MODEL
 # =========================
 @dataclass
 class Patient:
+    # Vitals
     age: int
     hr: int
     sbp: int
@@ -35,19 +55,29 @@ class Patient:
     rr: int
     temp: float
 
-    # Neuro
+    # GCS
     gcs_e: int
     gcs_v: int
     gcs_m: int
 
-    # Symptoms/context
+    # Symptoms
     chest_pain: bool
     dyspnea: bool
     trauma: bool
-    pain_level: int  # VAS 0-10
+    pain_level: int
 
-    onset: str        # "Đột ngột" / "Từ từ"
-    progression: str  # "Nặng dần" / "Ổn định" / "Giảm"
+    # Course
+    onset: str
+    progression: str
+
+    # Extra context (new)
+    fast_stroke: bool
+    bleeding: bool
+    abdominal_pain: bool
+    pregnancy: bool
+    infection_suspected: bool
+    anaphylaxis: bool
+    poisoning_overdose: bool
 
 # =========================
 # CLINICAL UTILITIES
@@ -56,7 +86,6 @@ def calculate_shock_index(hr, sbp):
     return round(hr / sbp, 2) if sbp > 0 else 0.0
 
 def calculate_ews(hr, rr, sbp, temp, spo2):
-    """Early Warning Score (đơn giản hoá cho demo tổng quát)"""
     score = 0
     if hr > 110 or hr < 50: score += 2
     if rr > 24 or rr < 10: score += 2
@@ -65,8 +94,11 @@ def calculate_ews(hr, rr, sbp, temp, spo2):
     if spo2 < 94: score += 3
     return score
 
+def gcs_total(p: Patient) -> int:
+    return p.gcs_e + p.gcs_v + p.gcs_m
+
 # =========================
-# SAFETY / VALIDATION
+# VALIDATION
 # =========================
 def validate_inputs(p: Patient):
     hard, soft = [], []
@@ -76,55 +108,55 @@ def validate_inputs(p: Patient):
     if not (50 <= p.spo2 <= 100): hard.append("SpO₂ ngoài phạm vi 50–100%.")
     if not (5 <= p.rr <= 60): hard.append("RR ngoài phạm vi 5–60.")
     if not (34.0 <= p.temp <= 42.0): hard.append("Nhiệt độ ngoài phạm vi 34–42°C.")
-    gcs = p.gcs_e + p.gcs_v + p.gcs_m
-    if not (3 <= gcs <= 15): hard.append("GCS không hợp lệ.")
+    g = gcs_total(p)
+    if not (3 <= g <= 15): hard.append("GCS không hợp lệ.")
 
-    # soft consistency hints
     if p.spo2 < 88 and not p.dyspnea:
         soft.append("SpO₂ rất thấp nhưng chưa tick 'Khó thở' (kiểm tra lại).")
 
+    if p.pregnancy and p.age < 10:
+        soft.append("Mang thai + tuổi rất nhỏ (kiểm tra lại).")
+
     return (len(hard) == 0), hard + soft
 
+# =========================
+# RED FLAGS (HARD SAFETY)
+# =========================
 def red_flags(p: Patient, si: float, ews: int):
-    """Hard safety – ưu tiên tuyệt đối"""
-    gcs = p.gcs_e + p.gcs_v + p.gcs_m
+    g = gcs_total(p)
     flags = []
 
-    if gcs <= 8: flags.append("Hôn mê nặng (GCS ≤ 8)")
-    if p.spo2 < 90: flags.append("Suy hô hấp nặng (SpO₂ < 90%)")
-    if p.sbp < 90: flags.append("Sốc / tụt huyết áp (SBP < 90)")
-    if si > 1.0: flags.append(f"Shock Index nguy hiểm ({si})")
-    if p.rr >= 30: flags.append("Thở nhanh nặng (RR ≥ 30)")
-    if p.hr >= 140: flags.append("Mạch nhanh nặng (HR ≥ 140)")
-    # EWS rất cao cũng coi là nguy kịch theo quy trình
-    if ews >= 7: flags.append("EWS rất cao (≥ 7)")
+    if p.anaphylaxis:
+        flags.append("Sốc phản vệ nghi ngờ")
+    if g <= 8:
+        flags.append("Hôn mê nặng (GCS ≤ 8)")
+    if p.fast_stroke:
+        flags.append("FAST dương tính (nghi đột quỵ)")
+    if p.spo2 < 90:
+        flags.append("Suy hô hấp nặng (SpO₂ < 90%)")
+    if p.sbp < 90:
+        flags.append("Sốc / tụt huyết áp (SBP < 90)")
+    if si > 1.0:
+        flags.append(f"Shock Index nguy hiểm ({si})")
+    if p.rr >= 30:
+        flags.append("Thở nhanh nặng (RR ≥ 30)")
+    if p.hr >= 140:
+        flags.append("Mạch nhanh nặng (HR ≥ 140)")
+    if p.bleeding and (p.sbp < 100 or p.hr > 110):
+        flags.append("Chảy máu + dấu hiệu huyết động xấu")
+    if p.poisoning_overdose and g <= 12:
+        flags.append("Nghi ngộ độc + giảm tri giác")
+    if ews >= 7:
+        flags.append("EWS rất cao (≥ 7)")
 
     return flags
 
 # =========================
-# AI RISK + UNCERTAINTY (ENSEMBLE, NO TRAIN)
+# AI RISK + UNCERTAINTY (NO TRAIN)
 # =========================
 def sigmoid(x: float) -> float:
     x = max(min(x, 40), -40)
     return 1.0 / (1.0 + math.exp(-x))
-
-def features(p: Patient):
-    gcs = p.gcs_e + p.gcs_v + p.gcs_m
-    return {
-        "age": float(p.age),
-        "hr_excess": float(max(0, p.hr - 90)),
-        "sbp_drop": float(max(0, 100 - p.sbp)),
-        "spo2_drop": float(max(0, 95 - p.spo2)),
-        "rr_excess": float(max(0, p.rr - 18)),
-        "temp_excess": float(max(0, p.temp - 37.5)),
-        "gcs_drop": float(max(0, 15 - gcs)),  # GCS giảm -> rủi ro tăng
-        "chest_pain": float(int(p.chest_pain)),
-        "dyspnea": float(int(p.dyspnea)),
-        "trauma": float(int(p.trauma)),
-        "pain_hi": float(int(p.pain_level >= 7)),
-        "onset_sudden": float(int(p.onset == "Đột ngột")),
-        "worsening": float(int(p.progression == "Nặng dần")),
-    }
 
 FEATURE_LABELS = {
     "spo2_drop": "SpO₂ thấp",
@@ -139,15 +171,48 @@ FEATURE_LABELS = {
     "pain_hi": "Đau nhiều (VAS ≥ 7)",
     "onset_sudden": "Khởi phát đột ngột",
     "worsening": "Nặng dần",
+    "fast_stroke": "FAST (+)",
+    "bleeding": "Chảy máu",
+    "abdominal_pain": "Đau bụng cấp",
+    "pregnancy": "Mang thai",
+    "infection": "Nghi nhiễm trùng",
+    "anaphylaxis": "Sốc phản vệ",
+    "poisoning": "Ngộ độc/quá liều",
     "age": "Tuổi",
 }
 
+def features(p: Patient):
+    g = gcs_total(p)
+    return {
+        "age": float(p.age),
+        "hr_excess": float(max(0, p.hr - 90)),
+        "sbp_drop": float(max(0, 100 - p.sbp)),
+        "spo2_drop": float(max(0, 95 - p.spo2)),
+        "rr_excess": float(max(0, p.rr - 18)),
+        "temp_excess": float(max(0, p.temp - 37.5)),
+        "gcs_drop": float(max(0, 15 - g)),
+
+        "chest_pain": float(int(p.chest_pain)),
+        "dyspnea": float(int(p.dyspnea)),
+        "trauma": float(int(p.trauma)),
+        "pain_hi": float(int(p.pain_level >= 7)),
+
+        "onset_sudden": float(int(p.onset == "Đột ngột")),
+        "worsening": float(int(p.progression == "Nặng dần")),
+
+        # extra context
+        "fast_stroke": float(int(p.fast_stroke)),
+        "bleeding": float(int(p.bleeding)),
+        "abdominal_pain": float(int(p.abdominal_pain)),
+        "pregnancy": float(int(p.pregnancy)),
+        "infection": float(int(p.infection_suspected)),
+        "anaphylaxis": float(int(p.anaphylaxis)),
+        "poisoning": float(int(p.poisoning_overdose)),
+    }
+
 def ensemble_predict_with_explain(p: Patient):
-    """
-    Ensemble logistic: trả (mean_risk, std_uncertainty, contrib_sorted, preds)
-    """
     base = {
-        "b0": -7.0,
+        "b0": -7.2,
         "age": 0.010,
         "hr_excess": 0.020,
         "sbp_drop": 0.050,
@@ -155,18 +220,28 @@ def ensemble_predict_with_explain(p: Patient):
         "rr_excess": 0.030,
         "temp_excess": 0.40,
         "gcs_drop": 0.55,
+
         "chest_pain": 0.25,
         "dyspnea": 0.55,
         "trauma": 0.35,
         "pain_hi": 0.15,
+
         "onset_sudden": 0.12,
         "worsening": 0.18,
+
+        "fast_stroke": 0.80,
+        "bleeding": 0.60,
+        "abdominal_pain": 0.25,
+        "pregnancy": 0.30,
+        "infection": 0.45,
+        "anaphylaxis": 1.20,
+        "poisoning": 0.55,
     }
 
     x = features(p)
     rng = np.random.default_rng(42)
     preds = []
-    for _ in range(21):
+    for _ in range(25):
         z = base["b0"] + rng.normal(0, 0.30)
         for k, v in x.items():
             z += base[k] * (1 + rng.normal(0, 0.10)) * v
@@ -176,7 +251,6 @@ def ensemble_predict_with_explain(p: Patient):
     mean_r = float(arr.mean())
     std_u = float(arr.std(ddof=1))
 
-    # explain (không phải SHAP nhưng “giải thích được”)
     contrib = {k: float(base[k] * v) for k, v in x.items()}
     contrib_sorted = dict(sorted(contrib.items(), key=lambda kv: abs(kv[1]), reverse=True))
     return mean_r, std_u, contrib_sorted, preds
@@ -192,33 +266,26 @@ def triage_from_risk(r: float) -> str:
     return "🟢 XANH"
 
 # =========================
-# DECISION POLICY (Safety-first + HITL)
+# DECISION POLICY
 # =========================
 def triage_decision(flags: list, ews: int, risk: float, u: float, p: Patient):
-    """
-    Priority order:
-    1) Red flags -> RED
-    2) EWS high -> RED/YELLOW
-    3) Otherwise risk + uncertainty (HITL)
-    """
     if flags:
         return "🔴 ĐỎ (CẤP CỨU)", "#FF4B4B", "Luật an toàn kích hoạt: " + ", ".join(flags)
 
-    # EWS logic (protocol-friendly)
+    # Protocol-friendly (EWS)
     if ews >= 5:
         return "🔴 ĐỎ (CẤP CỨU)", "#FF4B4B", f"EWS cao (≥5): {ews}. Ưu tiên đánh giá ngay."
-    if ews >= 3 or p.chest_pain or p.pain_level >= 7:
-        # vẫn check uncertainty: nếu uncertainty cao -> yêu cầu confirm
-        note = f"EWS trung bình/triệu chứng ưu tiên: EWS={ews}."
+    if ews >= 3 or p.chest_pain or p.pain_level >= 7 or p.fast_stroke or p.anaphylaxis or p.bleeding:
+        note = f"Ưu tiên theo triệu chứng/điểm: EWS={ews}."
         if uncertainty_level(u) == "CAO":
             note += " Uncertainty CAO → cần bác sĩ xác nhận/đo lại."
         return "🟡 VÀNG (ƯU TIÊN)", "#FFA500", note
 
-    # AI risk + uncertainty
+    # AI assist
     base = triage_from_risk(risk)
     if base.startswith("🔴"):
         if uncertainty_level(u) == "CAO":
-            return "🟡 VÀNG (REVIEW)", "#FFA500", "Risk cao nhưng Uncertainty CAO → không áp đặt ĐỎ, cần bác sĩ review."
+            return "🟡 VÀNG (REVIEW)", "#FFA500", "Risk cao nhưng Uncertainty CAO → cần bác sĩ review."
         return "🔴 ĐỎ (CẢNH BÁO)", "#FF4B4B", "Risk cao & Uncertainty thấp → cảnh báo mạnh."
     if base.startswith("🟡"):
         if uncertainty_level(u) == "CAO":
@@ -230,44 +297,115 @@ def triage_decision(flags: list, ews: int, risk: float, u: float, p: Patient):
 # DEPARTMENT RECOMMENDATION
 # =========================
 def recommend_department(p: Patient, triage: str, flags: list):
-    """
-    Đề xuất khoa (tổng quát). Nếu ĐỎ/flags: Resus/ICU trước rồi định hướng.
-    """
     is_peds = p.age < 16
-    gcs = p.gcs_e + p.gcs_v + p.gcs_m
+    g = gcs_total(p)
 
+    # RED/flags: stabilize first
     if flags or ("🔴" in triage):
         if is_peds:
             return "Cấp cứu/Hồi sức (ưu tiên) → Nhi", "Nguy kịch + tuổi nhi."
+        if p.anaphylaxis:
+            return "Cấp cứu/Hồi sức (ưu tiên)", "Sốc phản vệ: ưu tiên ABC + xử trí phản vệ."
+        if p.fast_stroke or g <= 12:
+            return "Cấp cứu/Hồi sức (ưu tiên) → Thần kinh", "Giảm tri giác/FAST (+) → định hướng thần kinh."
+        if p.bleeding:
+            return "Cấp cứu/Hồi sức (ưu tiên) → Ngoại / Tiêu hoá", "Chảy máu: ưu tiên hồi sức, định hướng ngoại/tiêu hoá."
         if p.trauma:
             return "Cấp cứu/Hồi sức (ưu tiên) → Ngoại/Chấn thương", "Nguy kịch + chấn thương."
         if p.chest_pain:
             return "Cấp cứu/Hồi sức (ưu tiên) → Tim mạch", "Nguy kịch + đau ngực."
         if p.dyspnea or p.spo2 < 94:
             return "Cấp cứu/Hồi sức (ưu tiên) → Hô hấp", "Nguy kịch + khó thở/SpO₂ giảm."
-        if gcs <= 12:
-            return "Cấp cứu/Hồi sức (ưu tiên) → Thần kinh", "Nguy kịch + tri giác giảm."
+        if p.poisoning_overdose:
+            return "Cấp cứu/Hồi sức (ưu tiên) → Chống độc / Nội", "Ngộ độc/quá liều nghi ngờ."
+        if p.pregnancy:
+            return "Cấp cứu/Hồi sức (ưu tiên) → Sản", "Nguy kịch + thai kỳ."
         return "Cấp cứu/Hồi sức (ưu tiên)", "Ưu tiên ổn định ABC trước, sau đó phân khoa."
 
-    # Non-red routing
+    # Non-red
     if is_peds:
         return "Nhi (hoặc Cấp cứu Nhi)", "Tuổi < 16."
+    if p.pregnancy:
+        return "Sản", "Thai kỳ."
+    if p.fast_stroke or g <= 13:
+        return "Thần kinh", "Nghi đột quỵ/tri giác giảm."
     if p.trauma:
-        return "Ngoại/Chấn thương chỉnh hình", "Chấn thương là triệu chứng chính."
+        return "Ngoại/Chấn thương chỉnh hình", "Chấn thương."
+    if p.bleeding:
+        return "Tiêu hoá / Ngoại", "Chảy máu (GI/ngoài)."
+    if p.abdominal_pain:
+        return "Tiêu hoá / Ngoại", "Đau bụng cấp."
     if p.chest_pain:
-        return "Tim mạch", "Đau ngực → ưu tiên ECG/men tim theo quy trình."
+        return "Tim mạch", "Đau ngực → ECG/men tim."
     if p.dyspnea or p.spo2 < 94:
         return "Hô hấp", "Khó thở/SpO₂ giảm."
-    if gcs <= 13 or (p.onset == "Đột ngột" and p.progression == "Nặng dần"):
-        return "Thần kinh", "Tri giác giảm hoặc diễn tiến đáng ngại."
-    if p.temp >= 38.5 and (p.hr >= 110 or p.rr >= 22):
-        return "Nội tổng quát / Nhiễm (tuỳ BV)", "Gợi ý nhiễm trùng: sốt + đáp ứng viêm."
+    if p.infection_suspected:
+        return "Nhiễm / Nội tổng quát", "Nghi nhiễm trùng."
+    if p.poisoning_overdose:
+        return "Chống độc / Nội", "Ngộ độc/quá liều."
     return "Cấp cứu tổng quát / Nội tổng quát", "Không có cụm triệu chứng nổi trội."
+
+# =========================
+# PROTOCOL ACTIONS (doctor-facing)
+# =========================
+def protocol_actions(dept: str, triage: str, p: Patient):
+    actions = []
+    # General by triage
+    if "🔴" in triage:
+        actions += [
+            "Ưu tiên ABC: đường thở – hô hấp – tuần hoàn.",
+            "Monitor, đo lại sinh hiệu sớm, đường truyền, chuẩn bị hồi sức.",
+            "Bác sĩ đánh giá ngay."
+        ]
+    elif "🟡" in triage:
+        actions += [
+            "Khám ưu tiên, theo dõi sát, đo lại sinh hiệu.",
+            "Làm cận lâm sàng theo triệu chứng."
+        ]
+    else:
+        actions += [
+            "Theo dõi cơ bản, tư vấn, hẹn tái khám nếu nặng lên."
+        ]
+
+    # Dept-specific
+    if "Tim mạch" in dept:
+        actions += ["ECG sớm (≤10 phút nếu nghi ACS).", "Xét nghiệm men tim theo protocol.", "Theo dõi đau ngực & dấu hiệu thiếu máu cơ tim."]
+    if "Hô hấp" in dept:
+        actions += ["Đánh giá đường thở/oxy, cân nhắc khí máu.", "X-quang phổi nếu phù hợp.", "Khí dung/thuốc theo tình huống lâm sàng."]
+    if "Thần kinh" in dept:
+        actions += ["Đánh giá FAST/GCS, kiểm tra đường huyết.", "Cân nhắc CT/đánh giá đột quỵ theo quy trình.", "Theo dõi tri giác liên tục."]
+    if "Ngoại" in dept or "Chấn thương" in dept:
+        actions += ["Kiểm soát chảy máu, bất động nếu chấn thương.", "Đánh giá tổn thương theo ABCDE.", "Cân nhắc siêu âm FAST trauma nếu phù hợp."]
+    if "Tiêu hoá" in dept:
+        actions += ["Đánh giá đau bụng/xuất huyết tiêu hoá.", "Theo dõi huyết động, xét nghiệm theo chỉ định.", "Cân nhắc hội chẩn nếu nặng."]
+    if "Nhiễm" in dept:
+        actions += ["Đánh giá sepsis: dấu hiệu nhiễm + huyết động.", "Xét nghiệm/cấy theo protocol nếu nghi nặng.", "Kháng sinh sớm nếu có chỉ định."]
+    if "Sản" in dept:
+        actions += ["Đánh giá thai kỳ/ra huyết/đau bụng.", "Theo dõi mẹ và thai (tuỳ điều kiện).", "Hội chẩn sản khi cần."]
+    if "Chống độc" in dept:
+        actions += ["Xác định chất/nghi ngờ quá liều.", "Theo dõi tri giác/hô hấp, cân nhắc giải độc.", "Liên hệ chống độc nếu cần."]
+
+    # Context boosters
+    if p.anaphylaxis:
+        actions += ["Phác đồ phản vệ theo quy định (ưu tiên)."]
+    if p.fast_stroke:
+        actions += ["Kích hoạt đường dây đột quỵ (nếu có)."]
+    if p.bleeding:
+        actions += ["Đánh giá nguồn chảy máu, cân nhắc truyền dịch/máu theo chỉ định."]
+
+    # Remove duplicates while preserving order
+    seen = set()
+    final = []
+    for a in actions:
+        if a not in seen:
+            seen.add(a)
+            final.append(a)
+    return final
 
 # =========================
 # EXPLANATION HELPERS
 # =========================
-def top_reasons(contrib_sorted, k=6):
+def top_reasons(contrib_sorted, k=7):
     out = []
     for feat, val in list(contrib_sorted.items())[:k]:
         if abs(val) < 0.05:
@@ -275,48 +413,58 @@ def top_reasons(contrib_sorted, k=6):
         out.append(FEATURE_LABELS.get(feat, feat))
     return out if out else ["Không có yếu tố nổi bật"]
 
-def uncertainty_reasons(p: Patient, ews: int, risk: float, u: float):
+def decision_support_reasons(p: Patient, triage: str, flags: list, ews: int, si: float, risk: float, u: float, dept: str):
+    g = gcs_total(p)
     reasons = []
-    # Near thresholds / gray zone
-    if 0.25 <= risk <= 0.45:
-        reasons.append("Risk nằm vùng xám (gần ngưỡng Vàng).")
-    if 0.60 <= risk <= 0.80:
-        reasons.append("Risk gần ngưỡng Đỏ.")
-    if 3 <= ews <= 5:
-        reasons.append("EWS gần ngưỡng cảnh báo.")
-    # Potential inconsistency
-    if p.spo2 < 88 and not p.dyspnea:
-        reasons.append("SpO₂ rất thấp nhưng không ghi nhận khó thở (mâu thuẫn).")
-    if p.sbp < 90 and p.hr < 60:
-        reasons.append("SBP thấp nhưng HR không tăng (cần kiểm tra đo lại).")
-    # Missing context signals
-    if p.pain_level == 0 and (p.chest_pain or p.trauma):
-        reasons.append("VAS=0 nhưng có triệu chứng (cần xác nhận mức đau).")
-    return reasons if reasons else ["Uncertainty thấp: các mô hình đồng thuận cao."]
 
-def action_suggestions(triage: str, dept: str):
-    if "🔴" in triage:
-        return [
-            "Ưu tiên ABC: đường thở – hô hấp – tuần hoàn.",
-            "Theo dõi monitor, đo lại sinh hiệu sớm.",
-            f"Chuyển/điều phối: {dept}.",
-            "Bác sĩ đánh giá ngay."
-        ]
-    if "🟡" in triage:
-        return [
-            "Khám ưu tiên, theo dõi sát.",
-            "Đo lại sinh hiệu nếu thay đổi triệu chứng.",
-            f"Định hướng chuyên khoa: {dept}.",
-            "Nếu nặng lên → nâng mức xử trí."
-        ]
-    return [
-        "Theo dõi, tư vấn, đánh giá thêm nếu cần.",
-        f"Định hướng: {dept}.",
-        "Dặn tái khám nếu xuất hiện dấu hiệu nguy hiểm."
-    ]
+    # Hard rules first
+    if flags:
+        reasons.append(f"❗ **Luật an toàn kích hoạt:** {', '.join(flags)}")
+        if g <= 8:
+            reasons.append("🧠 **GCS ≤ 8** → ưu tiên cấp cứu dù sinh hiệu khác có thể bình thường.")
+        if p.fast_stroke:
+            reasons.append("⚡ **FAST (+)** → nghi đột quỵ, cần xử trí theo quy trình.")
+        if p.anaphylaxis:
+            reasons.append("🚨 **Nghi phản vệ** → ưu tiên ABC + phác đồ phản vệ.")
+    else:
+        reasons.append("✅ Không kích hoạt red flags bắt buộc.")
+
+    # Clinical scores
+    reasons.append(f"📊 **EWS = {ews}**, Shock Index = **{si}**, GCS = **{g}/15**")
+
+    # Course/context
+    if p.onset == "Đột ngột":
+        reasons.append("⚡ **Khởi phát đột ngột** → gợi ý biến cố cấp.")
+    if p.progression == "Nặng dần":
+        reasons.append("📈 **Nặng dần** → nguy cơ xấu nếu trì hoãn xử trí.")
+    if p.bleeding:
+        reasons.append("🩸 **Có chảy máu** → cần đánh giá huyết động & nguồn chảy máu.")
+    if p.abdominal_pain:
+        reasons.append("腹 **Đau bụng cấp** → định hướng tiêu hoá/ngoại.")
+    if p.pregnancy:
+        reasons.append("🤰 **Thai kỳ** → ưu tiên Sản khi phù hợp.")
+    if p.infection_suspected:
+        reasons.append("🦠 **Nghi nhiễm trùng** → cân nhắc sepsis theo protocol.")
+    if p.poisoning_overdose:
+        reasons.append("☠️ **Nghi ngộ độc/quá liều** → theo dõi tri giác/hô hấp.")
+
+    # AI assist
+    reasons.append(f"🤖 **AI Risk = {risk*100:.1f}%** (chỉ hỗ trợ, không override luật/protocol).")
+    ul = uncertainty_level(u)
+    if ul == "THẤP":
+        reasons.append("📉 **Uncertainty thấp** → các mô hình đồng thuận cao.")
+    elif ul == "TRUNG BÌNH":
+        reasons.append("⚠️ **Uncertainty trung bình** → nên đo lại vitals/bổ sung ngữ cảnh.")
+    else:
+        reasons.append("🟠 **Uncertainty cao** → cần bác sĩ đánh giá trước khi quyết định mạnh.")
+
+    # Dept routing
+    reasons.append(f"🏥 **Định hướng khoa:** {dept}")
+
+    return reasons
 
 # =========================
-# MAIN APP
+# APP UI
 # =========================
 st.title("🏥 Smart Triage AI Pro – Hệ thống phân loại cấp cứu tổng quát")
 st.caption(f"{APP_VERSION} | {MODEL_NOTE}")
@@ -326,7 +474,7 @@ if "logs" not in st.session_state:
 if "last_case" not in st.session_state:
     st.session_state["last_case"] = None
 
-tab1, tab2, tab3 = st.tabs(["📝 Tiếp nhận", "📊 Dashboard", "📑 Nhật ký / Export"])
+tab1, tab2, tab3 = st.tabs(["📝 Tiếp nhận", "📊 Dashboard", "📑 Nhật ký / Export + Explain"])
 
 # -------------------------
 # TAB 1: INTAKE
@@ -349,9 +497,6 @@ with tab1:
             e = st.selectbox("Mở mắt (E)", [4, 3, 2, 1], format_func=lambda x: f"{x} điểm")
             v = st.selectbox("Lời nói (V)", [5, 4, 3, 2, 1], format_func=lambda x: f"{x} điểm")
             m = st.selectbox("Vận động (M)", [6, 5, 4, 3, 2, 1], format_func=lambda x: f"{x} điểm")
-            gcs_total = e + v + m
-            st.info(f"Tổng điểm GCS: {gcs_total}/15")
-
             onset = st.selectbox("Khởi phát", ["Đột ngột", "Từ từ"])
             progression = st.selectbox("Diễn tiến", ["Nặng dần", "Ổn định", "Giảm"])
 
@@ -362,6 +507,15 @@ with tab1:
             trauma = st.checkbox("Chấn thương")
             pain_level = st.select_slider("Mức độ đau (VAS)", options=list(range(11)), value=0)
 
+            st.markdown("**Context mở rộng (để chuyển khoa & protocol chuẩn hơn)**")
+            fast_stroke = st.checkbox("FAST (+) nghi đột quỵ (méo miệng/yếu tay/nói khó)")
+            bleeding = st.checkbox("Chảy máu (ngoài / nôn ra máu / phân đen)")
+            abdominal_pain = st.checkbox("Đau bụng cấp")
+            pregnancy = st.checkbox("Thai kỳ")
+            infection_suspected = st.checkbox("Nghi nhiễm trùng (sốt/ớn lạnh/lơ mơ)")
+            anaphylaxis = st.checkbox("Nghi phản vệ (phù mặt/khò khè/mề đay)")
+            poisoning_overdose = st.checkbox("Nghi ngộ độc / quá liều")
+
         submit = st.form_submit_button("PHÂN LOẠI NGAY", type="primary", use_container_width=True)
 
     if submit:
@@ -369,71 +523,75 @@ with tab1:
             age=int(age), hr=int(hr), sbp=int(sbp), spo2=int(spo2), rr=int(rr), temp=float(temp),
             gcs_e=int(e), gcs_v=int(v), gcs_m=int(m),
             chest_pain=bool(chest_pain), dyspnea=bool(dyspnea), trauma=bool(trauma), pain_level=int(pain_level),
-            onset=str(onset), progression=str(progression)
+            onset=str(onset), progression=str(progression),
+            fast_stroke=bool(fast_stroke), bleeding=bool(bleeding), abdominal_pain=bool(abdominal_pain),
+            pregnancy=bool(pregnancy), infection_suspected=bool(infection_suspected),
+            anaphylaxis=bool(anaphylaxis), poisoning_overdose=bool(poisoning_overdose)
         )
 
         ok, issues = validate_inputs(p)
         if issues:
             st.warning("Kiểm tra dữ liệu:\n- " + "\n- ".join(issues))
+        if not ok:
+            st.stop()
 
-        # core scores
+        g = gcs_total(p)
         si = calculate_shock_index(p.hr, p.sbp)
         ews = calculate_ews(p.hr, p.rr, p.sbp, p.temp, p.spo2)
         flags = red_flags(p, si, ews)
 
-        # AI
         risk, u, contrib_sorted, preds = ensemble_predict_with_explain(p)
-
-        # Decision
         triage, color, note = triage_decision(flags, ews, risk, u, p)
-
-        # Department
         dept, dept_reason = recommend_department(p, triage, flags)
+        actions = protocol_actions(dept, triage, p)
 
-        # Display header
-        st.markdown(
-            f"<div class='triage-header' style='background-color:{color};'><h2>{triage}</h2></div>",
-            unsafe_allow_html=True
-        )
+        st.markdown(f"<div class='triage-header' style='background-color:{color};'><h2>{triage}</h2></div>", unsafe_allow_html=True)
         st.caption(note)
 
-        # metrics
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("EWS", ews)
         c2.metric("Shock Index", si)
-        c3.metric("GCS", f"{gcs_total}/15")
+        c3.metric("GCS", f"{g}/15")
         c4.metric("Risk (AI)", f"{risk*100:.1f}%")
         c5.metric("Uncertainty (σ)", f"{u:.3f}")
 
         if flags:
             st.error("⚠️ **Red flags (Luật an toàn):** " + ", ".join(flags))
 
-        # Department recommendation
         st.markdown("### 🏥 Đề xuất chuyển khoa")
         st.write(f"**{dept}**")
         st.caption(f"Lý do: {dept_reason}")
 
-        # Deep explanations (short in intake)
-        st.markdown("### 🔎 Lý do nổi bật (AI)")
+        st.markdown("### 🧾 Protocol / Hành động gợi ý")
+        for a in actions[:10]:
+            st.write("• " + a)
+
+        st.markdown("### 🔎 Lý do hỗ trợ quyết định (nhiều dữ kiện cho bác sĩ)")
+        reasons = decision_support_reasons(p, triage, flags, ews, si, risk, u, dept)
+        for r in reasons[:12]:
+            st.write("• " + r)
+
+        st.markdown("### 🔍 Lý do nổi bật (AI) – yếu tố tác động mạnh")
         st.write("• " + "\n• ".join(top_reasons(contrib_sorted)))
 
-        # SBAR summary
         sbar = (
-            f"SBAR: BN {p.age}t. GCS {gcs_total}/15. HR {p.hr}. SBP {p.sbp}. "
-            f"RR {p.rr}. SpO2 {p.spo2}%. Temp {p.temp}. "
-            f"EWS {ews}, SI {si}. "
+            f"SBAR: BN {p.age}t. GCS {g}/15. HR {p.hr}. SBP {p.sbp}. RR {p.rr}. "
+            f"SpO2 {p.spo2}%. Temp {p.temp}. EWS {ews}, SI {si}. "
             f"Risk {risk*100:.1f}%, Unc {u:.3f}. "
             f"Phân loại: {triage}. Chuyển khoa: {dept}."
         )
         st.text_area("Tóm tắt (SBAR):", sbar)
 
-        # Save last_case + logs (audit)
-        last_case = {
+        # Save logs
+        row = {
             "Thời gian": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Tuổi": p.age, "HR": p.hr, "SBP": p.sbp, "SpO2": p.spo2, "RR": p.rr, "Temp": p.temp,
-            "GCS": gcs_total, "E": p.gcs_e, "V": p.gcs_v, "M": p.gcs_m,
+            "GCS": g, "E": p.gcs_e, "V": p.gcs_v, "M": p.gcs_m,
             "Đau ngực": p.chest_pain, "Khó thở": p.dyspnea, "Chấn thương": p.trauma, "VAS": p.pain_level,
             "Khởi phát": p.onset, "Diễn tiến": p.progression,
+            "FAST": p.fast_stroke, "Chảy máu": p.bleeding, "Đau bụng": p.abdominal_pain,
+            "Thai kỳ": p.pregnancy, "Nghi nhiễm": p.infection_suspected,
+            "Phản vệ": p.anaphylaxis, "Ngộ độc": p.poisoning_overdose,
             "EWS": ews, "ShockIndex": si,
             "Risk": risk, "Uncertainty": u, "UncLevel": uncertainty_level(u),
             "RedFlags": ", ".join(flags),
@@ -444,26 +602,10 @@ with tab1:
             "SBAR": sbar,
             "AppVersion": APP_VERSION
         }
-        st.session_state["last_case"] = {
-            "patient": asdict(p),
-            "derived": {"gcs": gcs_total, "ews": ews, "si": si, "risk": risk, "u": u},
-            "decision": {"triage": triage, "note": note, "flags": flags},
-            "dept": {"name": dept, "reason": dept_reason},
-            "explain": {
-                "top_reasons": top_reasons(contrib_sorted),
-                "uncertainty_reasons": uncertainty_reasons(p, ews, risk, u),
-                "actions": action_suggestions(triage, dept),
-                "contrib_table": [{"feature": k, "label": FEATURE_LABELS.get(k, k), "contribution": float(v)}
-                                  for k, v in list(contrib_sorted.items())[:12]],
-                "preds": preds,
-            },
-            "sbar": sbar,
-            "time": last_case["Thời gian"]
-        }
-        st.session_state["logs"].append(last_case)
+        st.session_state["logs"].append(row)
+        st.session_state["last_case"] = {"row": row, "contrib": contrib_sorted, "preds": preds, "actions": actions, "reasons": reasons}
 
-        st.markdown("<div class='small-note'>⚠️ Demo nghiên cứu/học thuật. Quyết định cuối cùng thuộc bác sĩ.</div>",
-                    unsafe_allow_html=True)
+        st.markdown("<div class='small-note'>⚠️ Demo nghiên cứu/học thuật. Quyết định cuối cùng thuộc bác sĩ.</div>", unsafe_allow_html=True)
 
 # -------------------------
 # TAB 2: DASHBOARD
@@ -472,11 +614,9 @@ with tab2:
     if st.session_state["logs"]:
         df = pd.DataFrame(st.session_state["logs"])
         colA, colB = st.columns([1, 1])
-
         with colA:
-            st.subheader("Tỷ lệ bệnh nhân theo phân màu")
+            st.subheader("Tỷ lệ theo phân loại")
             st.bar_chart(df["Phân loại"].value_counts())
-
         with colB:
             st.subheader("Tỷ lệ theo khoa đề xuất")
             st.bar_chart(df["Khoa đề xuất"].value_counts())
@@ -489,7 +629,7 @@ with tab2:
         st.info("Chưa có dữ liệu. Vào tab **Tiếp nhận** để nhập ca.")
 
 # -------------------------
-# TAB 3: LOGS / EXPORT + DEEP EXPLAIN
+# TAB 3: LOGS/EXPORT + DEEP EXPLAIN
 # -------------------------
 with tab3:
     left, right = st.columns([1, 1])
@@ -515,45 +655,35 @@ with tab3:
         if not case:
             st.info("Chưa có ca nào. Vào tab **Tiếp nhận** và bấm **PHÂN LOẠI NGAY**.")
         else:
-            # Panel 1: Safety rules
+            row = case["row"]
             st.markdown("### 1) Luật an toàn (Hard rules)")
-            flags = case["decision"]["flags"]
-            if flags:
-                st.error("Kích hoạt red flags: " + ", ".join(flags))
+            if row.get("RedFlags"):
+                st.error("Kích hoạt: " + row["RedFlags"])
             else:
                 st.success("Không kích hoạt red flags.")
 
-            # Panel 2: Clinical scores
-            st.markdown("### 2) Điểm lâm sàng (EWS / Shock Index / GCS)")
-            d = case["derived"]
-            st.write(f"- **GCS:** {d['gcs']}/15")
-            st.write(f"- **EWS:** {d['ews']}")
-            st.write(f"- **Shock Index:** {d['si']}")
+            st.markdown("### 2) Điểm lâm sàng")
+            st.write(f"- GCS: **{row['GCS']}/15**")
+            st.write(f"- EWS: **{row['EWS']}**")
+            st.write(f"- Shock Index: **{row['ShockIndex']}**")
 
-            # Panel 3: AI risk
-            st.markdown("### 3) AI Risk (tại sao ra % này?)")
-            st.write(f"- **Risk:** {d['risk']*100:.1f}%")
-            st.write("- **Lý do nổi bật:** " + "; ".join(case["explain"]["top_reasons"]))
+            st.markdown("### 3) AI Risk + lý do")
+            st.write(f"- Risk: **{row['Risk']*100:.1f}%**")
+            st.write(f"- Uncertainty σ: **{row['Uncertainty']:.3f}** ({row['UncLevel']})")
             with st.expander("Bảng đóng góp đặc trưng (giải thích sâu)"):
-                st.dataframe(pd.DataFrame(case["explain"]["contrib_table"]), use_container_width=True)
+                top = list(case["contrib"].items())[:14]
+                table = [{"feature": k, "label": FEATURE_LABELS.get(k, k), "contribution": float(v)} for k, v in top]
+                st.dataframe(pd.DataFrame(table), use_container_width=True)
 
-            # Panel 4: Uncertainty
-            st.markdown("### 4) Uncertainty (vì sao chắc/không chắc?)")
-            st.write(f"- **σ:** {d['u']:.3f} ({uncertainty_level(d['u'])})")
-            st.write("• " + "\n• ".join(case["explain"]["uncertainty_reasons"]))
-            with st.expander("Phân bố dự đoán của ensemble (debug)"):
-                st.write(pd.DataFrame({"p_i": case["explain"]["preds"]}).describe())
+            st.markdown("### 4) Lý do hỗ trợ quyết định (doctor-facing)")
+            for r in case["reasons"][:14]:
+                st.write("• " + r)
 
-            # Panel 5: Decision + routing
-            st.markdown("### 5) Quyết định + Chuyển khoa")
-            st.write(f"- **Triage:** {case['decision']['triage']}")
-            st.write(f"- **Ghi chú:** {case['decision']['note']}")
-            st.write(f"- **Khoa đề xuất:** {case['dept']['name']}")
-            st.caption("Lý do: " + case["dept"]["reason"])
+            st.markdown("### 5) Chuyển khoa + protocol")
+            st.write(f"- Khoa: **{row['Khoa đề xuất']}**")
+            st.caption("Lý do: " + row["Lý do chuyển khoa"])
+            for a in case["actions"][:10]:
+                st.write("• " + a)
 
-            # Panel 6: Actions
-            st.markdown("### 6) Gợi ý hành động (Actionable)")
-            st.write("• " + "\n• ".join(case["explain"]["actions"]))
-
-            with st.expander("SBAR (để chuyển giao nhanh)"):
-                st.text(case["sbar"])
+            with st.expander("SBAR"):
+                st.text(row["SBAR"])
