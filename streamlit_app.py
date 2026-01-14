@@ -11,7 +11,7 @@ import streamlit as st
 # METADATA
 # =========================
 APP_NAME = "General Emergency Triage AI"
-APP_VERSION = "2.1 – General / Safety-first"
+APP_VERSION = "3.6 – General / Safety-first"
 MODEL_DESC = "Rule-based + Risk + Uncertainty + Human-in-the-loop"
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
