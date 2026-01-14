@@ -1,0 +1,124 @@
+import math
+import numpy as np
+import streamlit as st
+
+st.set_page_config(page_title="TriageAI Demo", layout="centered")
+st.title("TriageAI – Risk + Uncertainty (Demo)")
+st.caption("Demo hỗ trợ phân luồng: định lượng rủi ro nguy kịch + độ không chắc chắn. Bác sĩ quyết định cuối.")
+
+# ---------- Helpers ----------
+def sigmoid(x: float) -> float:
+    return 1 / (1 + math.exp(-x))
+
+def risk_model(age, hr, sbp, spo2, rr, avpu_idx, chest_pain, trauma):
+    """
+    Mô hình demo kiểu logistic (không phải model y tế thật).
+    Trả về p = P(nguy kịch) trong [0,1].
+    """
+    # Chuẩn hóa nhẹ để ổn định
+    z = (
+        -6.5
+        + 0.015 * age
+        + 0.020 * max(0, hr - 90)
+        + 0.040 * max(0, 100 - sbp)
+        + 0.090 * max(0, 95 - spo2)
+        + 0.030 * max(0, rr - 18)
+        + 0.80 * avpu_idx
+        + 0.35 * (1 if chest_pain else 0)
+        + 0.45 * (1 if trauma else 0)
+    )
+    return sigmoid(z)
+
+def uncertainty_bootstrap(age, hr, sbp, spo2, rr, avpu_idx, chest_pain, trauma, n=25, seed=42):
+    """
+    Uncertainty demo: bootstrap/jitter nhiều lần và lấy độ lệch chuẩn dự đoán.
+    u càng cao => mô hình càng "không chắc".
+    """
+    rng = np.random.default_rng(seed)
+    ps = []
+    for _ in range(n):
+        # jitter nhỏ quanh đo đạc (demo)
+        age_j  = age  + rng.normal(0, 1.5)
+        hr_j   = hr   + rng.normal(0, 4.0)
+        sbp_j  = sbp  + rng.normal(0, 4.0)
+        spo2_j = spo2 + rng.normal(0, 1.0)
+        rr_j   = rr   + rng.normal(0, 2.0)
+
+        p = risk_model(age_j, hr_j, sbp_j, spo2_j, rr_j, avpu_idx, chest_pain, trauma)
+        ps.append(p)
+    ps = np.array(ps)
+    return float(ps.mean()), float(ps.std())
+
+def triage_decision(risk, u, red_flag):
+    """
+    Quy tắc Human-in-the-loop:
+    - Nếu có red flag => ưu tiên Đỏ ngay (cảnh báo mạnh)
+    - Nếu không: dùng Risk + Uncertainty để gợi ý
+    """
+    if red_flag:
+        return "🔴 ĐỎ (Red flag)", "Cảnh báo ngay theo luật y khoa (red flag)."
+
+    # Gợi ý theo risk
+    if risk >= 0.70:
+        base = "🔴 ĐỎ"
+    elif risk >= 0.30:
+        base = "🟡 VÀNG"
+    else:
+        base = "🟢 XANH"
+
+    # Điều chỉnh thông điệp theo uncertainty
+    if u >= 0.20:
+        note = "⚠️ Uncertainty CAO: khuyến nghị bác sĩ đánh giá kỹ trước khi chốt."
+    elif u >= 0.10:
+        note = "Uncertainty TRUNG BÌNH: nên kiểm tra thêm dấu hiệu/khai thác."
+    else:
+        note = "Uncertainty THẤP: mô hình khá tự tin."
+
+    return base, note
+
+# ---------- UI ----------
+st.subheader("Nhập dữ liệu lâm sàng ban đầu")
+
+col1, col2 = st.columns(2)
+with col1:
+    age = st.number_input("Tuổi", 0, 120, 40)
+    hr = st.number_input("Mạch (HR, bpm)", 30, 220, 90)
+    sbp = st.number_input("Huyết áp tâm thu (SBP, mmHg)", 50, 220, 120)
+with col2:
+    spo2 = st.number_input("SpO₂ (%)", 50, 100, 98)
+    rr = st.number_input("Nhịp thở (RR, /phút)", 5, 60, 18)
+    avpu = st.selectbox("Tri giác (AVPU)", ["A (tỉnh)", "V (đáp ứng lời)", "P (đáp ứng đau)", "U (không đáp ứng)"])
+
+st.subheader("Triệu chứng / bối cảnh (tuỳ chọn)")
+c1, c2, c3 = st.columns(3)
+with c1:
+    chest_pain = st.checkbox("Đau ngực")
+with c2:
+    trauma = st.checkbox("Chấn thương")
+with c3:
+    severe_dyspnea = st.checkbox("Khó thở nặng (cảm nhận)")
+
+# Red flags (luật y khoa đơn giản để demo)
+avpu_idx = ["A (tỉnh)", "V (đáp ứng lời)", "P (đáp ứng đau)", "U (không đáp ứng)"].index(avpu)
+red_flag = (spo2 < 90) or (sbp < 90) or (avpu_idx >= 2) or severe_dyspnea
+
+st.divider()
+
+if st.button("Đánh giá Risk + Uncertainty", type="primary"):
+    mean_p, u = uncertainty_bootstrap(age, hr, sbp, spo2, rr, avpu_idx, chest_pain, trauma)
+    risk = mean_p  # dùng mean probability làm risk
+
+    triage, note = triage_decision(risk, u, red_flag)
+
+    st.subheader("Kết quả")
+    st.metric("Risk score (P nguy kịch)", f"{risk*100:.1f}%")
+    st.metric("Uncertainty (độ không chắc chắn)", f"{u:.3f}")
+
+    if "🔴" in triage:
+        st.error(f"**Gợi ý phân luồng:** {triage}\n\n{note}")
+    elif "🟡" in triage:
+        st.warning(f"**Gợi ý phân luồng:** {triage}\n\n{note}")
+    else:
+        st.success(f"**Gợi ý phân luồng:** {triage}\n\n{note}")
+
+    st.caption("Lưu ý: Đây là demo phục vụ thuyết trình/ý tưởng. Không dùng để chẩn đoán hoặc quyết định lâm sàng thật.")
