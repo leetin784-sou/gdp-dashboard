@@ -48,7 +48,7 @@ class Patient:
     temp_c: float
     avpu: str  # A/V/P/U
     chest_pain: bool
-    trauma: bool
+    rauma(trauma): bool
     severe_dyspnea: bool
 
 # =========================
